@@ -1,5 +1,6 @@
 {
   "repositories": {
-    "example": "/Users/darrenoakey/src/daz-python-mcp/example"
+    "example": "/Users/darrenoakey/src/daz-python-mcp/example",
+    "3dprint": "/Users/darrenoakey/src/daz-3d-print"
   }
 }

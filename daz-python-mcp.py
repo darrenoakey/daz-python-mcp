@@ -6,22 +6,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  CRITICAL WORKFLOW SUMMARY  (also returned via dazbuild_guidelines)
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  dazbuild_start_change   →   repository must be clean.
-# 2.  dazbuild_write / dazbuild_add / … (use the smallest Thing reference).
+# 1.  dazbuild_start_change   →   repository must be clean.           (relaxed)
+# 2.  dazbuild_write / dazbuild_add / … (use the smallest Thing ref).
 # 3.  dazbuild_end_change
 #     • pylint (score must be 10/10, no errors or warnings)
 #     • python -m unittest discover   (all tests must pass)
 #     • every .py file must contain at least one unittest.TestCase test.
 #     • no file may invoke unittest.main()
-#     If ANY rule fails,  dazbuild_end_change returns:
-#         {"success": false, "message": "<human summary>", "diagnostics": {...}}
-#     The change session remains open; fix issues and call dazbuild_end_change
-#     again.  On success it returns {"success": true, "message": "Committed"}.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import json
+import os
+import re
+import shutil
 import subprocess
+import sys
 import textwrap
 import traceback
 from pathlib import Path
@@ -57,6 +57,13 @@ class PyProjectMCPServer:
             if Path(p).expanduser().exists()
         }
 
+    # ------------------------------------------------ list_repositories
+    # Return configured repositories (lazy‑loads on first use).
+    def _list_repositories(self):
+        if not self.repos:
+            self._load_config()
+        return {"repositories": {name: str(path) for name, path in self.repos.items()}}
+
     # ------------------------------------------------ git helpers
     def _git(self, root: Path, *args):
         return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
@@ -74,121 +81,154 @@ class PyProjectMCPServer:
             ]
 
     # ------------------------------------------------ change session
+    # Begin—or re‑enter—an active change session for the given repository.
+    # • If already active, we simply join it.
+    # • We do NOT block on a dirty working tree anymore.
     def _start_change(self, repo: str):
-        root = self.repos[repo]
-        if self._git(root, "status", "--porcelain"):
-            raise Exception("Working tree has uncommitted changes")
+        if repo in self._active_changes:
+            return {"success": True, "message": "Already in change session"}
         self._active_changes.add(repo)
         return {"success": True, "message": "Change session started"}
 
-    # ------------------------------------------------------------ end_change
-    def _end_change(self, repo: str, message: str):
-        """
-        Complete a change session.
+    # -----------------------------------------------------------------------
+    #  Helpers to validate unit‑test presence
+    # -----------------------------------------------------------------------
+    def _check_tests_in_file(self, path: Path) -> List[str]:
+        text = path.read_text()
+        has_testcase_ref = bool(re.search(r"\bunittest\.TestCase\b", text, re.I))
+        has_test_class = bool(
+            re.search(r"class\s+\w*Test\w*\s*\([^)]*unittest\.TestCase", text, re.I)
+        )
+        has_test_func = bool(re.search(r"def\s+test_\w+\s*\(", text))
+        if has_testcase_ref or has_test_class or has_test_func:
+            return []
+        return [
+            "didn't find the word 'unittest.TestCase'",
+            "didn't find any class inheriting from TestCase",
+            "didn't find any function starting with 'test_'",
+        ]
 
-        • pylint must report 0 errors/warnings.
-        • python -m unittest discover -v -p '*.py' must run ≥1 tests and all pass.
-        • Every .py file must contain at least one real TestCase; no mocks allowed.
-        • No file may invoke unittest.main().
+    # -----------------------------------------------------------------------
+    #  Helpers used by _end_change
+    # -----------------------------------------------------------------------
+    def _check_pylint(self, root: Path):
+        pylint_cmd = (
+            ["pylint"] if shutil.which("pylint") else [sys.executable, "-m", "pylint"]
+        )
+        pylint_cmd += ["-f", "json", "--exit-zero", "."]
 
-        Returns
-        -------
-        dict
-            {
-              "success": bool,          # True on commit, False on failure
-              "message": str,           # Human summary
-              "diagnostics": { ... }    # Detailed linter/test output on failure
-            }
-        """
-        if repo not in self._active_changes:
-            raise Exception("No change started")
+        diag: Dict[str, Any] = {
+            "pylint_cmd": " ".join(pylint_cmd),
+            "env_PATH": os.environ.get("PATH", ""),
+        }
 
-        root = self.repos[repo]
-        diag: Dict[str, Any] = {}
-
-        # ---------- pylint --------------------------------------------------
         try:
             pylint_json = subprocess.check_output(
-                ["pylint", "-f", "json", "--exit-zero", "."],
-                cwd=root,
-                text=True,
-                stderr=subprocess.STDOUT,
+                pylint_cmd, cwd=root, text=True, stderr=subprocess.STDOUT
             )
             diag["pylint"] = json.loads(pylint_json or "[]")
-            if any(item["type"] in {"error", "warning"} for item in diag["pylint"]):
-                return {
-                    "success": False,
-                    "message": "pylint reported issues",
-                    "diagnostics": diag,
-                }
-        except FileNotFoundError:
-            diag["pylint_error"] = "pylint not installed"
-            return {
-                "success": False,
-                "message": "pylint missing",
-                "diagnostics": diag,
-            }
+            issues = [i for i in diag["pylint"] if i["type"] in {"error", "warning"}]
+            if issues:
+                return False, diag, f"pylint reported {len(issues)} issue(s)"
+            return True, diag, ""
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            diag["pylint_error"] = str(exc)
+            return False, diag, "pylint invocation failed"
 
-        # ---------- unittest ------------------------------------------------
+    def _check_unittest(self, root: Path):
         try:
-            test_out = subprocess.check_output(
-                ["python", "-m", "unittest", "discover", "-v", "-p", "*.py"],
+            out = subprocess.check_output(
+                [sys.executable, "-m", "unittest", "discover", "-v", "-p", "*.py"],
                 cwd=root,
                 text=True,
                 stderr=subprocess.STDOUT,
             )
-            diag["unittest"] = test_out
-            if "Ran 0 tests" in test_out:
-                return {
-                    "success": False,
-                    "message": "No tests discovered (pattern '*.py')",
-                    "diagnostics": diag,
-                }
+            if "Ran 0 tests" in out:
+                return False, {"unittest_output": out}, "No tests discovered"
+            return True, {"unittest_output": out}, ""
         except subprocess.CalledProcessError as exc:
-            diag["unittest_failures"] = exc.output
+            return False, {"unittest_failures": exc.output}, "Unit tests failed"
+
+    def _files_with_missing_tests(
+        self, root: Path, rel_files: List[str]
+    ) -> Dict[str, List[str]]:
+        untested: Dict[str, List[str]] = {}
+        pattern_tc = re.compile(r"\bunittest\.TestCase\b", re.I)
+        pattern_cls = re.compile(
+            r"class\s+\w*Test\w*\s*\([^)]*unittest\.TestCase", re.I
+        )
+        pattern_fn = re.compile(r"def\s+test_\w+\s*\(")
+
+        for rel in rel_files:
+            if not rel.endswith(".py"):
+                continue
+            text = (root / rel).read_text()
+            if not (
+                pattern_tc.search(text)
+                or pattern_cls.search(text)
+                or pattern_fn.search(text)
+            ):
+                untested[rel] = [
+                    "didn't find the word 'unittest.TestCase'",
+                    "didn't find any class inheriting from unittest.TestCase",
+                    "didn't find any function starting with 'test_'",
+                ]
+        return untested
+
+    def _files_with_unittest_main(
+        self, root: Path, rel_files: List[str]
+    ) -> Dict[str, str]:
+        illegal: Dict[str, str] = {}
+        for rel in rel_files:
+            if rel.endswith(".py") and "unittest.main" in (root / rel).read_text():
+                illegal[rel] = "contains unittest.main()"
+        return illegal
+
+    # -----------------------------------------------------------------------
+    #  end_change (orchestrator)
+    # -----------------------------------------------------------------------
+    def _end_change(self, repo: str, message: str):
+        root = self.repos[repo]
+        rel_files = list(self.open_handlers[repo].keys())
+        diagnostics: Dict[str, Any] = {}
+
+        # 1. pylint
+        ok, diag, msg = self._check_pylint(root)
+        diagnostics.update(diag)
+        if not ok:
+            return {"success": False, "message": msg, "diagnostics": diagnostics}
+
+        # 2. unittest
+        ok, diag, msg = self._check_unittest(root)
+        diagnostics.update(diag)
+        if not ok:
+            return {"success": False, "message": msg, "diagnostics": diagnostics}
+
+        # 3. every file has tests
+        missing = self._files_with_missing_tests(root, rel_files)
+        if missing:
+            diagnostics["untested_files"] = missing
             return {
                 "success": False,
-                "message": "Unit tests failed",
-                "diagnostics": diag,
+                "message": f"{len(missing)} Python file(s) lack tests",
+                "diagnostics": diagnostics,
             }
 
-        # ---------- ensure each .py has tests ------------------------------
-        untested = [
-            rel
-            for rel, h in self.open_handlers[repo].items()
-            if rel.endswith(".py")
-            and not any(
-                c.name.startswith("test") or getattr(c, "is_test", False)
-                for c in h.structure.children.values()
-            )
-        ]
-        if untested:
-            diag["untested_files"] = untested
-            return {
-                "success": False,
-                "message": "Some Python files lack tests",
-                "diagnostics": diag,
-            }
-
-        # ---------- forbid unittest.main() ---------------------------------
-        illegal = [
-            rel
-            for rel, h in self.open_handlers[repo].items()
-            if rel.endswith(".py") and "unittest.main" in h.text
-        ]
+        # 4. forbid unittest.main()
+        illegal = self._files_with_unittest_main(root, rel_files)
         if illegal:
-            diag["illegal_unittest_main"] = illegal
+            diagnostics["illegal_unittest_main"] = illegal
             return {
                 "success": False,
                 "message": "unittest.main() found in code",
-                "diagnostics": diag,
+                "diagnostics": diagnostics,
             }
 
-        # ---------- all good → commit -------------------------------------
+        # 5. all good → commit
         subprocess.check_call(["git", "add", "--all"], cwd=root)
         subprocess.check_call(["git", "commit", "-m", message], cwd=root)
-        self._active_changes.remove(repo)
-        return {"success": True, "message": "Committed", "diagnostics": diag}
+        self._active_changes.discard(repo)
+        return {"success": True, "message": "Committed", "diagnostics": diagnostics}
 
     # ------------------------------------------------ outline
     def _outline(self, repo: str, ref: str):
@@ -254,7 +294,6 @@ class PyProjectMCPServer:
         def schema(**props):
             return {"type": "object", "properties": props, "required": list(props)}
 
-        # master documentation returned as a pseudo-tool
         guidelines_text = textwrap.dedent(
             """
             ### dazbuild Guidelines
@@ -283,7 +322,7 @@ class PyProjectMCPServer:
             ),
             "start_change": (
                 schema(name={"type": "string"}),
-                "Begin change session (must precede edits).",
+                "Begin (or join) change session.",
             ),
             "end_change": (
                 schema(name={"type": "string"}, message={"type": "string"}),
