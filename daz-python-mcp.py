@@ -13,6 +13,7 @@
 #     • python -m unittest discover   (all tests must pass)
 #     • every .py file must contain at least one unittest.TestCase test.
 #     • no file may invoke unittest.main()
+#     • all code files must be smaller than 8192 bytes
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -56,6 +57,74 @@ class PyProjectMCPServer:
             for n, p in json.loads(cfg.read_text()).get("repositories", {}).items()
             if Path(p).expanduser().exists()
         }
+
+    # ------------------------------------------------ instructions handling
+    def _get_instructions_path(self, repo: str) -> Path:
+        """Get the path to the instructions file for a repository."""
+        repo_root = self.repos[repo]
+        return repo_root / ".dazbuild" / "instructions.txt"
+
+    def _get_default_instructions(self) -> str:
+        """Return default instructions that explain dazbuild rules and best practices."""
+        return textwrap.dedent(
+            """
+            # Dazbuild Instructions
+
+            ## End Change Validation Rules
+            When you call `dazbuild_end_change`, the following checks must pass:
+
+            1. **Pylint Score**: Must be 10/10 with no errors or warnings
+            2. **Unit Tests**: All tests must pass via `python -m unittest discover`
+            3. **Test Coverage**: Every .py file must contain at least one unittest.TestCase test
+            4. **No unittest.main()**: Files cannot invoke unittest.main() directly
+            5. **File Size Limit**: All code files must be smaller than 8192 bytes
+
+            ## Best Practices for Using Dazbuild
+
+            ### Work with Small References
+            - Always edit at the **smallest hierarchy node** possible
+            - Instead of rewriting entire files, target specific functions, methods, or classes
+            - Use `dazbuild_outline` to see the structure and find the right reference
+            - Example: Edit `myfile.py::MyClass::my_method` instead of `myfile.py`
+
+            ### Workflow Pattern
+            1. `dazbuild_start_change` - Begin your change session
+            2. Use `dazbuild_get` to examine current code
+            3. Use `dazbuild_write` or `dazbuild_add` for targeted changes
+            4. `dazbuild_end_change` - Validate and commit
+
+            ### File Size Management
+            - Keep code files under 8192 bytes
+            - If a file grows too large, refactor into multiple smaller files
+            - Split large classes into smaller, focused classes
+            - Extract utility functions into separate modules
+
+            ### Testing Strategy
+            - Add real unit tests to every Python file (no mocks unless necessary)
+            - Test both happy path and edge cases
+            - Keep test methods focused and well-named
+            - Place tests in the same file or dedicated test files
+
+            ### Code Quality
+            - Write clean, readable code that passes pylint
+            - Use meaningful variable and function names
+            - Add docstrings for public methods and classes
+            - Keep functions focused on a single responsibility
+        """
+        ).strip()
+
+    def _get_repo_instructions(self, repo: str) -> str:
+        """Get instructions for a repository, using defaults if none exist."""
+        instructions_path = self._get_instructions_path(repo)
+        if instructions_path.exists():
+            return instructions_path.read_text().strip()
+        return self._get_default_instructions()
+
+    def _update_repo_instructions(self, repo: str, instructions: str):
+        """Update instructions for a repository."""
+        instructions_path = self._get_instructions_path(repo)
+        instructions_path.parent.mkdir(parents=True, exist_ok=True)
+        instructions_path.write_text(instructions)
 
     # ------------------------------------------------ list_repositories
     # Return configured repositories (lazy‑loads on first use).
@@ -149,6 +218,47 @@ class PyProjectMCPServer:
         except subprocess.CalledProcessError as exc:
             return False, {"unittest_failures": exc.output}, "Unit tests failed"
 
+    def _check_file_sizes(self, root: Path, rel_files: List[str]) -> Dict[str, int]:
+        """Check that all code files are under the size limit (8192 bytes)."""
+        MAX_FILE_SIZE = 8192
+        oversized: Dict[str, int] = {}
+
+        # Define code file extensions
+        code_extensions = {
+            ".py",
+            ".js",
+            ".ts",
+            ".jsx",
+            ".tsx",
+            ".java",
+            ".cpp",
+            ".c",
+            ".h",
+            ".hpp",
+            ".cs",
+            ".go",
+            ".rs",
+            ".rb",
+            ".php",
+            ".swift",
+            ".kt",
+            ".scala",
+            ".clj",
+            ".hs",
+            ".ml",
+            ".fs",
+            ".vb",
+            ".sql",
+        }
+
+        for rel in rel_files:
+            if any(rel.endswith(ext) for ext in code_extensions):
+                file_size = (root / rel).stat().st_size
+                if file_size > MAX_FILE_SIZE:
+                    oversized[rel] = file_size
+
+        return oversized
+
     def _files_with_missing_tests(
         self, root: Path, rel_files: List[str]
     ) -> Dict[str, List[str]]:
@@ -224,11 +334,40 @@ class PyProjectMCPServer:
                 "diagnostics": diagnostics,
             }
 
-        # 5. all good → commit
+        # 5. check file sizes
+        oversized = self._check_file_sizes(root, rel_files)
+        if oversized:
+            diagnostics["oversized_files"] = oversized
+            return {
+                "success": False,
+                "message": f"{len(oversized)} file(s) exceed 8192 byte limit",
+                "diagnostics": diagnostics,
+            }
+
+        # 6. all good → commit
         subprocess.check_call(["git", "add", "--all"], cwd=root)
         subprocess.check_call(["git", "commit", "-m", message], cwd=root)
         self._active_changes.discard(repo)
-        return {"success": True, "message": "Committed", "diagnostics": diagnostics}
+
+        # Get current instructions
+        instructions = self._get_repo_instructions(repo)
+
+        # Prepare learning prompt
+        learning_prompt = (
+            f"Congratulations! Your action was a success and the change has been closed.\n\n"
+            f"We have instructions for dealing with this repository:\n"
+            f"{instructions}\n\n"
+            f"If you have learned anything during this change that could be added to "
+            f"the instructions to make further changes go smoother, please call "
+            f"dazbuild_update_instructions with a complete replacement instructions list."
+        )
+
+        return {
+            "success": True,
+            "message": "Committed",
+            "diagnostics": diagnostics,
+            "learning_prompt": learning_prompt,
+        }
 
     # ------------------------------------------------ outline
     def _outline(self, repo: str, ref: str):
@@ -281,7 +420,11 @@ class PyProjectMCPServer:
         self.indexer.index_repository(
             name, root, {k: h.structure for k, h in self.open_handlers[name].items()}
         )
-        return {"opened": True, "files": files}
+
+        # Get and return instructions
+        instructions = self._get_repo_instructions(name)
+
+        return {"opened": True, "files": files, "instructions": instructions}
 
     def _close(self, name):
         self.open_handlers.pop(name, None)
@@ -302,8 +445,9 @@ class PyProjectMCPServer:
             • Edit at the *smallest hierarchy node* you can.
             • Add a `unittest` block (real tests, no mocks) to **every** Python file.
             • Never invoke `unittest.main()`; `dazbuild_end_change` runs tests.
+            • Keep all code files under 8192 bytes; refactor if larger.
 
-            `dazbuild_end_change` runs pylint + tests. If failures occur it returns
+            `dazbuild_end_change` runs pylint + tests + file size checks. If failures occur it returns
             `{ "success": false, "message": "...", "diagnostics": {...} }`.
             Fix issues and call `dazbuild_end_change` again.
             """
@@ -326,7 +470,7 @@ class PyProjectMCPServer:
             ),
             "end_change": (
                 schema(name={"type": "string"}, message={"type": "string"}),
-                "Commit edits (pylint + tests). Returns success boolean.",
+                "Commit edits (pylint + tests + file sizes). Returns success boolean.",
             ),
             "outline": (
                 schema(name={"type": "string"}, reference={"type": "string"}),
@@ -364,6 +508,13 @@ class PyProjectMCPServer:
                     limit={"type": "integer", "default": 10},
                 ),
                 "Vector search in repo.",
+            ),
+            "update_instructions": (
+                schema(
+                    name={"type": "string"},
+                    instructions={"type": "string"},
+                ),
+                "Update repository-specific instructions for future changes.",
             ),
         }
 
@@ -412,6 +563,9 @@ class PyProjectMCPServer:
                     res = self._search(
                         args["name"], args["query"], args.get("limit", 10)
                     )
+                elif cmd == "update_instructions":
+                    self._update_repo_instructions(args["name"], args["instructions"])
+                    res = {"updated": True, "instructions": args["instructions"]}
                 else:
                     res = {"error": f"Unknown tool {name}"}
                 return [types.TextContent(type="text", text=json.dumps(res, indent=2))]
