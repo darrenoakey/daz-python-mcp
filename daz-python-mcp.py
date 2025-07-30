@@ -139,15 +139,66 @@ class PyProjectMCPServer:
 
     def _git_list_files(self, root: Path):
         try:
-            return self._git(
+            # Get all tracked and untracked files from git
+            all_files = self._git(
                 root, "ls-files", "--others", "--cached", "--exclude-standard"
             ).splitlines()
+
+            # Filter out files that don't actually exist on disk
+            existing_files = [rel for rel in all_files if (root / rel).exists()]
+
+            return existing_files
         except Exception:
+            # Fallback: scan filesystem directly
             return [
                 str(p.relative_to(root))
                 for p in root.rglob("*")
                 if p.is_file() and not p.name.startswith(".")
             ]
+
+    def _git_check_status(self, root: Path):
+        """Check if there are any modified, staged, or untracked files."""
+        try:
+            status_output = self._git(root, "status", "--porcelain")
+            if not status_output:
+                return {"clean": True, "files": []}
+
+            changed_files = []
+            for line in status_output.splitlines():
+                if len(line) >= 3:
+                    status = line[:2]
+                    filename = line[3:]
+
+                    # Decode status codes
+                    index_status = status[0]
+                    worktree_status = status[1]
+
+                    file_info = {"file": filename, "status": []}
+
+                    if index_status == "M":
+                        file_info["status"].append("staged modified")
+                    elif index_status == "A":
+                        file_info["status"].append("staged added")
+                    elif index_status == "D":
+                        file_info["status"].append("staged deleted")
+                    elif index_status == "R":
+                        file_info["status"].append("staged renamed")
+                    elif index_status == "C":
+                        file_info["status"].append("staged copied")
+
+                    if worktree_status == "M":
+                        file_info["status"].append("modified")
+                    elif worktree_status == "D":
+                        file_info["status"].append("deleted")
+                    elif worktree_status == "?":
+                        file_info["status"].append("untracked")
+
+                    changed_files.append(file_info)
+
+            return {"clean": False, "files": changed_files}
+        except Exception:
+            # If git status fails, assume clean
+            return {"clean": True, "files": []}
 
     # ------------------------------------------------ change session
     # Begin—or re‑enter—an active change session for the given repository.
@@ -415,6 +466,10 @@ class PyProjectMCPServer:
     # ------------------------------------------------ repo open/close
     def _open(self, name):
         root = self.repos[name]
+
+        # Check for any uncommitted changes
+        status_info = self._git_check_status(root)
+
         files = self._git_list_files(root)
         self.open_handlers[name] = {rel: get_handler_for(root / rel) for rel in files}
         self.indexer.index_repository(
@@ -424,7 +479,25 @@ class PyProjectMCPServer:
         # Get and return instructions
         instructions = self._get_repo_instructions(name)
 
-        return {"opened": True, "files": files, "instructions": instructions}
+        result = {"opened": True, "files": files, "instructions": instructions}
+
+        # If there are uncommitted changes, include them in the response
+        if not status_info["clean"]:
+            result["change_in_progress"] = True
+            result["changed_files"] = status_info["files"]
+
+            # Create a human-readable summary
+            file_summaries = []
+            for file_info in status_info["files"]:
+                status_text = ", ".join(file_info["status"])
+                file_summaries.append(f"{file_info['file']} ({status_text})")
+
+            result["change_summary"] = (
+                f"Repository has uncommitted changes in {len(status_info['files'])} file(s): "
+                + "; ".join(file_summaries)
+            )
+
+        return result
 
     def _close(self, name):
         self.open_handlers.pop(name, None)
