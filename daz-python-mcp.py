@@ -7,7 +7,7 @@
 #  CRITICAL WORKFLOW SUMMARY  (also returned via dazbuild_guidelines)
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  dazbuild_start_change   →   repository must be clean.           (relaxed)
-# 2.  dazbuild_write / dazbuild_add / … (use the smallest Thing ref).
+# 2.  dazbuild_write / dazbuild_add / dazbuild_delete / … (use the smallest Thing ref).
 # 3.  dazbuild_end_change
 #     • pylint (score must be 10/10, no errors or warnings)
 #     • python -m unittest discover   (all tests must pass)
@@ -26,7 +26,7 @@ import sys
 import textwrap
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 import mcp.server.stdio
 import mcp.types as types
@@ -90,7 +90,7 @@ class PyProjectMCPServer:
             ### Workflow Pattern
             1. `dazbuild_start_change` - Begin your change session
             2. Use `dazbuild_get` to examine current code
-            3. Use `dazbuild_write` or `dazbuild_add` for targeted changes
+            3. Use `dazbuild_write`, `dazbuild_add`, or `dazbuild_delete` for targeted changes
             4. `dazbuild_end_change` - Validate and commit
 
             ### File Size Management
@@ -98,6 +98,19 @@ class PyProjectMCPServer:
             - If a file grows too large, refactor into multiple smaller files
             - Split large classes into smaller, focused classes
             - Extract utility functions into separate modules
+
+            ### Code Documentation Requirements
+            - **File Headers**: Every file MUST have a comprehensive comment at the top explaining:
+              - What the file is for
+              - Its main purpose and functionality
+              - How it relates to other files in the project
+              - Any important dependencies or interactions
+            - **Function Documentation**: Every function (private or public) MUST have a docstring that explains:
+              - What the function does
+              - Parameters and their types
+              - Return value and type
+              - Any exceptions that might be raised
+              - Example usage when appropriate
 
             ### Testing Strategy
             - Add real unit tests to every Python file (no mocks unless necessary)
@@ -229,6 +242,32 @@ class PyProjectMCPServer:
         ]
 
     # -----------------------------------------------------------------------
+    #  Test running helpers
+    # -----------------------------------------------------------------------
+    def _run_file_tests(self, root: Path, rel_file: str) -> Tuple[bool, Dict[str, Any]]:
+        """Run tests for a specific file and return success status and output."""
+        try:
+            # Convert the file path to a module path for unittest
+            module_path = rel_file.replace("/", ".").replace(".py", "")
+
+            out = subprocess.check_output(
+                [sys.executable, "-m", "unittest", module_path, "-v"],
+                cwd=root,
+                text=True,
+                stderr=subprocess.STDOUT,
+            )
+
+            # Check if any tests were found and run
+            if "Ran 0 tests" in out:
+                return False, {"test_output": out, "error": "No tests found in file"}
+
+            return True, {"test_output": out}
+        except subprocess.CalledProcessError as exc:
+            return False, {"test_output": exc.output, "error": "Tests failed"}
+        except Exception as exc:
+            return False, {"error": str(exc), "trace": traceback.format_exc()}
+
+    # -----------------------------------------------------------------------
     #  Helpers used by _end_change
     # -----------------------------------------------------------------------
     def _check_pylint(self, root: Path):
@@ -345,6 +384,15 @@ class PyProjectMCPServer:
                 illegal[rel] = "contains unittest.main()"
         return illegal
 
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Format file size in a human-readable way."""
+        if size_bytes < 1024:
+            return f"{size_bytes} bytes"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        else:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+
     # -----------------------------------------------------------------------
     #  end_change (orchestrator)
     # -----------------------------------------------------------------------
@@ -389,9 +437,14 @@ class PyProjectMCPServer:
         oversized = self._check_file_sizes(root, rel_files)
         if oversized:
             diagnostics["oversized_files"] = oversized
+            # Create a detailed message about which files are oversized
+            file_details = []
+            for filename, size in oversized.items():
+                file_details.append(f"{filename} ({self._format_file_size(size)})")
+
             return {
                 "success": False,
-                "message": f"{len(oversized)} file(s) exceed 8192 byte limit",
+                "message": f"Files exceed 8192 byte limit: {', '.join(file_details)}",
                 "diagnostics": diagnostics,
             }
 
@@ -438,15 +491,64 @@ class PyProjectMCPServer:
     def _write(self, repo, ref, content):  # noqa: ANN001
         if repo not in self._active_changes:
             raise Exception("Must call dazbuild_start_change first")
-        h = self.open_handlers[repo][ref.split("::")[0]]
+
+        root = self.repos[repo]
+        rel_file = ref.split("::")[0]
+
+        # Perform the write
+        h = self.open_handlers[repo][rel_file]
         h.write(ref, content)
-        self.indexer.update_file(repo, self.repos[repo], ref.split("::")[0])
+        self.indexer.update_file(repo, root, rel_file)
+
+        # Run tests on the file after writing
+        if rel_file.endswith(".py"):
+            test_success, test_output = self._run_file_tests(root, rel_file)
+            if not test_success:
+                # Revert the write by reloading the handler
+                self.open_handlers[repo][rel_file] = get_handler_for(root / rel_file)
+                self.indexer.update_file(repo, root, rel_file)
+                return {
+                    "written": False,
+                    "error": "Tests failed after write operation",
+                    "test_results": test_output,
+                }
+            return {"written": True, "test_results": test_output}
+
         return {"written": True}
+
+    def _delete(self, repo, reference):  # noqa: ANN001
+        """Delete a file from the repository."""
+        if repo not in self._active_changes:
+            raise Exception("Must call dazbuild_start_change first")
+
+        root = self.repos[repo]
+
+        # For now, only support deleting whole files
+        if "::" in reference:
+            raise Exception(
+                "Can only delete whole files, not parts of files. Use dazbuild_write to modify file contents."
+            )
+
+        rel_path = reference
+
+        if rel_path not in self.open_handlers[repo]:
+            raise Exception(f"File {rel_path} not found in repository")
+
+        # Remove from filesystem
+        file_path = root / rel_path
+        if file_path.exists():
+            file_path.unlink()
+
+        # Remove from open handlers
+        del self.open_handlers[repo][rel_path]
+
+        return {"deleted": rel_path}
 
     def _add(self, repo, obj_type, parent, name, content):  # noqa: ANN001
         if repo not in self._active_changes:
             raise Exception("Must call dazbuild_start_change first")
         root = self.repos[repo]
+
         if obj_type == "file":
             rel = str(Path(parent) / name) if parent else name
             path = root / rel
@@ -454,14 +556,65 @@ class PyProjectMCPServer:
             path.write_text(content)
             self.open_handlers[repo][rel] = get_handler_for(path)
             self.indexer.update_file(repo, root, rel)
+
+            # Run tests if it's a Python file
+            if rel.endswith(".py"):
+                test_success, test_output = self._run_file_tests(root, rel)
+                if not test_success:
+                    # Remove the file if tests fail
+                    path.unlink()
+                    del self.open_handlers[repo][rel]
+                    return {
+                        "added_file": None,
+                        "error": "Tests failed after adding file",
+                        "test_results": test_output,
+                    }
+                return {"added_file": rel, "test_results": test_output}
+
             return {"added_file": rel}
-        handler = self.open_handlers[repo][parent.split("::")[0]]
-        handler.add(parent, name, content)
-        self.indexer.update_file(repo, root, parent.split("::")[0])
-        return {"added": name}
+        else:
+            # Adding to existing file
+            rel_file = parent.split("::")[0]
+            handler = self.open_handlers[repo][rel_file]
+            handler.add(parent, name, content)
+            self.indexer.update_file(repo, root, rel_file)
+
+            # Run tests on the modified file
+            if rel_file.endswith(".py"):
+                test_success, test_output = self._run_file_tests(root, rel_file)
+                if not test_success:
+                    # Reload the handler to revert changes
+                    self.open_handlers[repo][rel_file] = get_handler_for(
+                        root / rel_file
+                    )
+                    self.indexer.update_file(repo, root, rel_file)
+                    return {
+                        "added": None,
+                        "error": "Tests failed after adding to file",
+                        "test_results": test_output,
+                    }
+                return {"added": name, "test_results": test_output}
+
+            return {"added": name}
 
     def _search(self, repo, query, limit):  # noqa: ANN001
         return {"matches": self.indexer.search(repo, query, limit)}
+
+    def _run_file_tests_tool(self, repo: str, reference: str):
+        """Run tests for a specific file (tool wrapper)."""
+        root = self.repos[repo]
+
+        # Extract the file path from the reference
+        rel_file = reference.split("::")[0]
+
+        if not rel_file.endswith(".py"):
+            return {"error": "Can only run tests on Python files"}
+
+        if rel_file not in self.open_handlers[repo]:
+            return {"error": f"File {rel_file} not found in repository"}
+
+        success, output = self._run_file_tests(root, rel_file)
+        return {"success": success, "file": rel_file, "test_results": output}
 
     # ------------------------------------------------ repo open/close
     def _open(self, name):
@@ -514,11 +667,13 @@ class PyProjectMCPServer:
             """
             ### dazbuild Guidelines
 
-            • **Always** call `dazbuild_start_change` before any write/add.
+            • **Always** call `dazbuild_start_change` before any write/add/delete.
             • Edit at the *smallest hierarchy node* you can.
             • Add a `unittest` block (real tests, no mocks) to **every** Python file.
             • Never invoke `unittest.main()`; `dazbuild_end_change` runs tests.
             • Keep all code files under 8192 bytes; refactor if larger.
+            • **Document everything**: File headers and function docstrings are required.
+            • **Tests run automatically**: write/add operations run tests and fail if tests fail.
 
             `dazbuild_end_change` runs pylint + tests + file size checks. If failures occur it returns
             `{ "success": false, "message": "...", "diagnostics": {...} }`.
@@ -559,7 +714,14 @@ class PyProjectMCPServer:
                     reference={"type": "string"},
                     content={"type": "string"},
                 ),
-                "Replace content at reference.",
+                "Replace content at reference. Runs tests after write; fails if tests fail.",
+            ),
+            "delete": (
+                schema(
+                    name={"type": "string"},
+                    reference={"type": "string"},
+                ),
+                "Delete a file from the repository.",
             ),
             "add": (
                 schema(
@@ -572,7 +734,7 @@ class PyProjectMCPServer:
                     object_name={"type": "string"},
                     content={"type": "string"},
                 ),
-                "Add new thing or file.",
+                "Add new thing or file. Runs tests after add; fails if tests fail.",
             ),
             "search": (
                 schema(
@@ -581,6 +743,13 @@ class PyProjectMCPServer:
                     limit={"type": "integer", "default": 10},
                 ),
                 "Vector search in repo.",
+            ),
+            "run_file_tests": (
+                schema(
+                    name={"type": "string"},
+                    reference={"type": "string"},
+                ),
+                "Run unit tests for a specific Python file.",
             ),
             "update_instructions": (
                 schema(
@@ -624,6 +793,8 @@ class PyProjectMCPServer:
                     res = self._get(args["name"], args["reference"])
                 elif cmd == "write":
                     res = self._write(args["name"], args["reference"], args["content"])
+                elif cmd == "delete":
+                    res = self._delete(args["name"], args["reference"])
                 elif cmd == "add":
                     res = self._add(
                         args["name"],
@@ -636,6 +807,8 @@ class PyProjectMCPServer:
                     res = self._search(
                         args["name"], args["query"], args.get("limit", 10)
                     )
+                elif cmd == "run_file_tests":
+                    res = self._run_file_tests_tool(args["name"], args["reference"])
                 elif cmd == "update_instructions":
                     self._update_repo_instructions(args["name"], args["instructions"])
                     res = {"updated": True, "instructions": args["instructions"]}
