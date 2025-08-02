@@ -8,25 +8,30 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  dazbuild_start_change   →   repository must be clean.           (relaxed)
 # 2.  dazbuild_write / dazbuild_add / dazbuild_delete / … (use the smallest Thing ref).
-# 3.  dazbuild_end_change
+# 3.  dazbuild_end_change  (runs verifications in parallel for speed)
+#     • no mocks or stubs allowed in any files
+#     • all code files must be smaller than 8192 bytes
+#     • every .py file must contain at least one unittest.TestCase test
+#     • tests must never access keyring (word 'keyring' cannot appear after TestCase)
+#     • no file may invoke unittest.main()
 #     • pylint (score must be 10/10, no errors or warnings)
 #     • python -m unittest discover   (all tests must pass)
-#     • every .py file must contain at least one unittest.TestCase test.
-#     • no file may invoke unittest.main()
-#     • all code files must be smaller than 8192 bytes
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 import textwrap
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set
+
+# Prevent tokenizer deadlocks when forking subprocesses
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Prevent .pyc files during test runs
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 import mcp.server.stdio
 import mcp.types as types
@@ -34,7 +39,8 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
 from indexer import CodeIndexer
-from handler_base import error, get_handler_for, Thing
+from handler_base import get_handler_for, Thing
+from file_verifier import FileVerifier
 
 
 # --------------------------------------------------------------------------- #
@@ -47,6 +53,7 @@ class PyProjectMCPServer:
         self.open_handlers: Dict[str, Dict[str, Any]] = {}
         self._active_changes: Set[str] = set()
         self.indexer = CodeIndexer()
+        self.verifier = FileVerifier()
         self._register_handlers()
 
     # ------------------------------------------------ configuration
@@ -73,11 +80,14 @@ class PyProjectMCPServer:
             ## End Change Validation Rules
             When you call `dazbuild_end_change`, the following checks must pass:
 
-            1. **Pylint Score**: Must be 10/10 with no errors or warnings
-            2. **Unit Tests**: All tests must pass via `python -m unittest discover`
-            3. **Test Coverage**: Every .py file must contain at least one unittest.TestCase test
-            4. **No unittest.main()**: Files cannot invoke unittest.main() directly
-            5. **File Size Limit**: All code files must be smaller than 8192 bytes
+            1. **No Mocks or Stubs**: No file may contain the words "mock" or "stub" - all tests should test real functionality
+            2. **File Size Limit**: All code files must be smaller than 8192 bytes
+            3. **Unit Tests**: Every .py file must contain at least one unittest.TestCase test
+            4. **No Keyring in Tests**: Tests should never access keyring - the word 'keyring' cannot appear after TestCase
+            5. **No unittest.main()**: Files cannot invoke unittest.main() directly
+            6. **Pylint Score**: Must be 10/10 with no errors or warnings
+
+            You can use `dazbuild_verify` to test these rules on any file without making changes.
 
             ## Best Practices for Using Dazbuild
 
@@ -90,8 +100,9 @@ class PyProjectMCPServer:
             ### Workflow Pattern
             1. `dazbuild_start_change` - Begin your change session
             2. Use `dazbuild_get` to examine current code
-            3. Use `dazbuild_write`, `dazbuild_add`, or `dazbuild_delete` for targeted changes
-            4. `dazbuild_end_change` - Validate and commit
+            3. Use `dazbuild_verify` to check files before editing (optional but recommended)
+            4. Use `dazbuild_write`, `dazbuild_add`, or `dazbuild_delete` for targeted changes
+            5. `dazbuild_end_change` - Validate and commit
 
             ### File Size Management
             - Keep code files under 8192 bytes
@@ -113,7 +124,8 @@ class PyProjectMCPServer:
               - Example usage when appropriate
 
             ### Testing Strategy
-            - Add real unit tests to every Python file (no mocks unless necessary)
+            - Add real unit tests to every Python file (no mocks or stubs allowed)
+            - Tests must never access the system keyring
             - Test both happy path and edge cases
             - Keep test methods focused and well-named
             - Place tests in the same file or dedicated test files
@@ -140,7 +152,6 @@ class PyProjectMCPServer:
         instructions_path.write_text(instructions)
 
     # ------------------------------------------------ list_repositories
-    # Return configured repositories (lazy‑loads on first use).
     def _list_repositories(self):
         if not self.repos:
             self._load_config()
@@ -152,17 +163,12 @@ class PyProjectMCPServer:
 
     def _git_list_files(self, root: Path):
         try:
-            # Get all tracked and untracked files from git
             all_files = self._git(
                 root, "ls-files", "--others", "--cached", "--exclude-standard"
             ).splitlines()
-
-            # Filter out files that don't actually exist on disk
             existing_files = [rel for rel in all_files if (root / rel).exists()]
-
             return existing_files
         except Exception:
-            # Fallback: scan filesystem directly
             return [
                 str(p.relative_to(root))
                 for p in root.rglob("*")
@@ -181,11 +187,8 @@ class PyProjectMCPServer:
                 if len(line) >= 3:
                     status = line[:2]
                     filename = line[3:]
-
-                    # Decode status codes
                     index_status = status[0]
                     worktree_status = status[1]
-
                     file_info = {"file": filename, "status": []}
 
                     if index_status == "M":
@@ -210,245 +213,33 @@ class PyProjectMCPServer:
 
             return {"clean": False, "files": changed_files}
         except Exception:
-            # If git status fails, assume clean
             return {"clean": True, "files": []}
 
     # ------------------------------------------------ change session
-    # Begin—or re‑enter—an active change session for the given repository.
-    # • If already active, we simply join it.
-    # • We do NOT block on a dirty working tree anymore.
     def _start_change(self, repo: str):
         if repo in self._active_changes:
             return {"success": True, "message": "Already in change session"}
         self._active_changes.add(repo)
         return {"success": True, "message": "Change session started"}
 
-    # -----------------------------------------------------------------------
-    #  Helpers to validate unit‑test presence
-    # -----------------------------------------------------------------------
-    def _check_tests_in_file(self, path: Path) -> List[str]:
-        text = path.read_text()
-        has_testcase_ref = bool(re.search(r"\bunittest\.TestCase\b", text, re.I))
-        has_test_class = bool(
-            re.search(r"class\s+\w*Test\w*\s*\([^)]*unittest\.TestCase", text, re.I)
-        )
-        has_test_func = bool(re.search(r"def\s+test_\w+\s*\(", text))
-        if has_testcase_ref or has_test_class or has_test_func:
-            return []
-        return [
-            "didn't find the word 'unittest.TestCase'",
-            "didn't find any class inheriting from TestCase",
-            "didn't find any function starting with 'test_'",
-        ]
-
-    # -----------------------------------------------------------------------
-    #  Test running helpers
-    # -----------------------------------------------------------------------
-    def _run_file_tests(self, root: Path, rel_file: str) -> Tuple[bool, Dict[str, Any]]:
-        """Run tests for a specific file and return success status and output."""
-        try:
-            # Convert the file path to a module path for unittest
-            module_path = rel_file.replace("/", ".").replace(".py", "")
-
-            out = subprocess.check_output(
-                [sys.executable, "-m", "unittest", module_path, "-v"],
-                cwd=root,
-                text=True,
-                stderr=subprocess.STDOUT,
-            )
-
-            # Check if any tests were found and run
-            if "Ran 0 tests" in out:
-                return False, {"test_output": out, "error": "No tests found in file"}
-
-            return True, {"test_output": out}
-        except subprocess.CalledProcessError as exc:
-            return False, {"test_output": exc.output, "error": "Tests failed"}
-        except Exception as exc:
-            return False, {"error": str(exc), "trace": traceback.format_exc()}
-
-    # -----------------------------------------------------------------------
-    #  Helpers used by _end_change
-    # -----------------------------------------------------------------------
-    def _check_pylint(self, root: Path):
-        pylint_cmd = (
-            ["pylint"] if shutil.which("pylint") else [sys.executable, "-m", "pylint"]
-        )
-        pylint_cmd += ["-f", "json", "--exit-zero", "."]
-
-        diag: Dict[str, Any] = {
-            "pylint_cmd": " ".join(pylint_cmd),
-            "env_PATH": os.environ.get("PATH", ""),
-        }
-
-        try:
-            pylint_json = subprocess.check_output(
-                pylint_cmd, cwd=root, text=True, stderr=subprocess.STDOUT
-            )
-            diag["pylint"] = json.loads(pylint_json or "[]")
-            issues = [i for i in diag["pylint"] if i["type"] in {"error", "warning"}]
-            if issues:
-                return False, diag, f"pylint reported {len(issues)} issue(s)"
-            return True, diag, ""
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-            diag["pylint_error"] = str(exc)
-            return False, diag, "pylint invocation failed"
-
-    def _check_unittest(self, root: Path):
-        try:
-            out = subprocess.check_output(
-                [sys.executable, "-m", "unittest", "discover", "-v", "-p", "*.py"],
-                cwd=root,
-                text=True,
-                stderr=subprocess.STDOUT,
-            )
-            if "Ran 0 tests" in out:
-                return False, {"unittest_output": out}, "No tests discovered"
-            return True, {"unittest_output": out}, ""
-        except subprocess.CalledProcessError as exc:
-            return False, {"unittest_failures": exc.output}, "Unit tests failed"
-
-    def _check_file_sizes(self, root: Path, rel_files: List[str]) -> Dict[str, int]:
-        """Check that all code files are under the size limit (8192 bytes)."""
-        MAX_FILE_SIZE = 8192
-        oversized: Dict[str, int] = {}
-
-        # Define code file extensions
-        code_extensions = {
-            ".py",
-            ".js",
-            ".ts",
-            ".jsx",
-            ".tsx",
-            ".java",
-            ".cpp",
-            ".c",
-            ".h",
-            ".hpp",
-            ".cs",
-            ".go",
-            ".rs",
-            ".rb",
-            ".php",
-            ".swift",
-            ".kt",
-            ".scala",
-            ".clj",
-            ".hs",
-            ".ml",
-            ".fs",
-            ".vb",
-            ".sql",
-        }
-
-        for rel in rel_files:
-            if any(rel.endswith(ext) for ext in code_extensions):
-                file_size = (root / rel).stat().st_size
-                if file_size > MAX_FILE_SIZE:
-                    oversized[rel] = file_size
-
-        return oversized
-
-    def _files_with_missing_tests(
-        self, root: Path, rel_files: List[str]
-    ) -> Dict[str, List[str]]:
-        untested: Dict[str, List[str]] = {}
-        pattern_tc = re.compile(r"\bunittest\.TestCase\b", re.I)
-        pattern_cls = re.compile(
-            r"class\s+\w*Test\w*\s*\([^)]*unittest\.TestCase", re.I
-        )
-        pattern_fn = re.compile(r"def\s+test_\w+\s*\(")
-
-        for rel in rel_files:
-            if not rel.endswith(".py"):
-                continue
-            text = (root / rel).read_text()
-            if not (
-                pattern_tc.search(text)
-                or pattern_cls.search(text)
-                or pattern_fn.search(text)
-            ):
-                untested[rel] = [
-                    "didn't find the word 'unittest.TestCase'",
-                    "didn't find any class inheriting from unittest.TestCase",
-                    "didn't find any function starting with 'test_'",
-                ]
-        return untested
-
-    def _files_with_unittest_main(
-        self, root: Path, rel_files: List[str]
-    ) -> Dict[str, str]:
-        illegal: Dict[str, str] = {}
-        for rel in rel_files:
-            if rel.endswith(".py") and "unittest.main" in (root / rel).read_text():
-                illegal[rel] = "contains unittest.main()"
-        return illegal
-
-    def _format_file_size(self, size_bytes: int) -> str:
-        """Format file size in a human-readable way."""
-        if size_bytes < 1024:
-            return f"{size_bytes} bytes"
-        elif size_bytes < 1024 * 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        else:
-            return f"{size_bytes / (1024 * 1024):.1f} MB"
-
-    # -----------------------------------------------------------------------
-    #  end_change (orchestrator)
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------ end_change
     def _end_change(self, repo: str, message: str):
         root = self.repos[repo]
+
+        # Get all files to verify
         rel_files = list(self.open_handlers[repo].keys())
-        diagnostics: Dict[str, Any] = {}
 
-        # 1. pylint
-        ok, diag, msg = self._check_pylint(root)
-        diagnostics.update(diag)
-        if not ok:
-            return {"success": False, "message": msg, "diagnostics": diagnostics}
+        # Run verification on the whole project
+        verify_result = self.verifier.verify(root, all_files=rel_files)
 
-        # 2. unittest
-        ok, diag, msg = self._check_unittest(root)
-        diagnostics.update(diag)
-        if not ok:
-            return {"success": False, "message": msg, "diagnostics": diagnostics}
-
-        # 3. every file has tests
-        missing = self._files_with_missing_tests(root, rel_files)
-        if missing:
-            diagnostics["untested_files"] = missing
+        if not verify_result["success"]:
             return {
                 "success": False,
-                "message": f"{len(missing)} Python file(s) lack tests",
-                "diagnostics": diagnostics,
+                "message": verify_result["error"],
+                "diagnostics": verify_result["diagnostics"],
             }
 
-        # 4. forbid unittest.main()
-        illegal = self._files_with_unittest_main(root, rel_files)
-        if illegal:
-            diagnostics["illegal_unittest_main"] = illegal
-            return {
-                "success": False,
-                "message": "unittest.main() found in code",
-                "diagnostics": diagnostics,
-            }
-
-        # 5. check file sizes
-        oversized = self._check_file_sizes(root, rel_files)
-        if oversized:
-            diagnostics["oversized_files"] = oversized
-            # Create a detailed message about which files are oversized
-            file_details = []
-            for filename, size in oversized.items():
-                file_details.append(f"{filename} ({self._format_file_size(size)})")
-
-            return {
-                "success": False,
-                "message": f"Files exceed 8192 byte limit: {', '.join(file_details)}",
-                "diagnostics": diagnostics,
-            }
-
-        # 6. all good → commit
+        # All good → commit
         subprocess.check_call(["git", "add", "--all"], cwd=root)
         subprocess.check_call(["git", "commit", "-m", message], cwd=root)
         self._active_changes.discard(repo)
@@ -469,7 +260,7 @@ class PyProjectMCPServer:
         return {
             "success": True,
             "message": "Committed",
-            "diagnostics": diagnostics,
+            "diagnostics": verify_result["diagnostics"],
             "learning_prompt": learning_prompt,
         }
 
@@ -485,10 +276,10 @@ class PyProjectMCPServer:
         return {"outline": to_dict(h.structure)}
 
     # ------------------------------------------------ thin wrappers
-    def _get(self, repo, ref):  # noqa: ANN001
+    def _get(self, repo, ref):
         return {"content": self.open_handlers[repo][ref.split("::")[0]].get(ref)}
 
-    def _write(self, repo, ref, content):  # noqa: ANN001
+    def _write(self, repo, ref, content):
         if repo not in self._active_changes:
             raise Exception("Must call dazbuild_start_change first")
 
@@ -500,30 +291,28 @@ class PyProjectMCPServer:
         h.write(ref, content)
         self.indexer.update_file(repo, root, rel_file)
 
-        # Run tests on the file after writing
-        if rel_file.endswith(".py"):
-            test_success, test_output = self._run_file_tests(root, rel_file)
-            if not test_success:
-                # Revert the write by reloading the handler
-                self.open_handlers[repo][rel_file] = get_handler_for(root / rel_file)
-                self.indexer.update_file(repo, root, rel_file)
-                return {
-                    "written": False,
-                    "error": "Tests failed after write operation",
-                    "test_results": test_output,
-                }
-            return {"written": True, "test_results": test_output}
+        # Verify the file after writing
+        verify_result = self.verifier.verify(root, rel_file)
 
-        return {"written": True}
+        if not verify_result["success"]:
+            # Revert the write by reloading the handler
+            self.open_handlers[repo][rel_file] = get_handler_for(root / rel_file)
+            self.indexer.update_file(repo, root, rel_file)
+            return {
+                "success": False,
+                "error": verify_result["error"],
+                "diagnostics": verify_result["diagnostics"],
+            }
 
-    def _delete(self, repo, reference):  # noqa: ANN001
+        return {"success": True, "diagnostics": verify_result["diagnostics"]}
+
+    def _delete(self, repo, reference):
         """Delete a file from the repository."""
         if repo not in self._active_changes:
             raise Exception("Must call dazbuild_start_change first")
 
         root = self.repos[repo]
 
-        # For now, only support deleting whole files
         if "::" in reference:
             raise Exception(
                 "Can only delete whole files, not parts of files. Use dazbuild_write to modify file contents."
@@ -542,9 +331,9 @@ class PyProjectMCPServer:
         # Remove from open handlers
         del self.open_handlers[repo][rel_path]
 
-        return {"deleted": rel_path}
+        return {"success": True, "deleted": rel_path}
 
-    def _add(self, repo, obj_type, parent, name, content):  # noqa: ANN001
+    def _add(self, repo, obj_type, parent, name, content):
         if repo not in self._active_changes:
             raise Exception("Must call dazbuild_start_change first")
         root = self.repos[repo]
@@ -557,21 +346,24 @@ class PyProjectMCPServer:
             self.open_handlers[repo][rel] = get_handler_for(path)
             self.indexer.update_file(repo, root, rel)
 
-            # Run tests if it's a Python file
-            if rel.endswith(".py"):
-                test_success, test_output = self._run_file_tests(root, rel)
-                if not test_success:
-                    # Remove the file if tests fail
-                    path.unlink()
-                    del self.open_handlers[repo][rel]
-                    return {
-                        "added_file": None,
-                        "error": "Tests failed after adding file",
-                        "test_results": test_output,
-                    }
-                return {"added_file": rel, "test_results": test_output}
+            # Verify the new file
+            verify_result = self.verifier.verify(root, rel)
 
-            return {"added_file": rel}
+            if not verify_result["success"]:
+                # Remove the file if verification fails
+                path.unlink()
+                del self.open_handlers[repo][rel]
+                return {
+                    "success": False,
+                    "error": verify_result["error"],
+                    "diagnostics": verify_result["diagnostics"],
+                }
+
+            return {
+                "success": True,
+                "added_file": rel,
+                "diagnostics": verify_result["diagnostics"],
+            }
         else:
             # Adding to existing file
             rel_file = parent.split("::")[0]
@@ -579,67 +371,60 @@ class PyProjectMCPServer:
             handler.add(parent, name, content)
             self.indexer.update_file(repo, root, rel_file)
 
-            # Run tests on the modified file
-            if rel_file.endswith(".py"):
-                test_success, test_output = self._run_file_tests(root, rel_file)
-                if not test_success:
-                    # Reload the handler to revert changes
-                    self.open_handlers[repo][rel_file] = get_handler_for(
-                        root / rel_file
-                    )
-                    self.indexer.update_file(repo, root, rel_file)
-                    return {
-                        "added": None,
-                        "error": "Tests failed after adding to file",
-                        "test_results": test_output,
-                    }
-                return {"added": name, "test_results": test_output}
+            # Verify the modified file
+            verify_result = self.verifier.verify(root, rel_file)
 
-            return {"added": name}
+            if not verify_result["success"]:
+                # Reload the handler to revert changes
+                self.open_handlers[repo][rel_file] = get_handler_for(root / rel_file)
+                self.indexer.update_file(repo, root, rel_file)
+                return {
+                    "success": False,
+                    "error": verify_result["error"],
+                    "diagnostics": verify_result["diagnostics"],
+                }
 
-    def _search(self, repo, query, limit):  # noqa: ANN001
-        return {"matches": self.indexer.search(repo, query, limit)}
+            return {
+                "success": True,
+                "added": name,
+                "diagnostics": verify_result["diagnostics"],
+            }
 
-    def _run_file_tests_tool(self, repo: str, reference: str):
-        """Run tests for a specific file (tool wrapper)."""
+    def _verify(self, repo: str, reference: str):
+        """Verify a file without making changes."""
         root = self.repos[repo]
-
-        # Extract the file path from the reference
         rel_file = reference.split("::")[0]
 
-        if not rel_file.endswith(".py"):
-            return {"error": "Can only run tests on Python files"}
-
         if rel_file not in self.open_handlers[repo]:
-            return {"error": f"File {rel_file} not found in repository"}
+            return {
+                "success": False,
+                "error": f"File {rel_file} not found in repository",
+            }
 
-        success, output = self._run_file_tests(root, rel_file)
-        return {"success": success, "file": rel_file, "test_results": output}
+        # Run verification on the file
+        verify_result = self.verifier.verify(root, rel_file)
+
+        return verify_result
+
+    def _search(self, repo, query, limit):
+        return {"matches": self.indexer.search(repo, query, limit)}
 
     # ------------------------------------------------ repo open/close
     def _open(self, name):
         root = self.repos[name]
-
-        # Check for any uncommitted changes
         status_info = self._git_check_status(root)
-
         files = self._git_list_files(root)
         self.open_handlers[name] = {rel: get_handler_for(root / rel) for rel in files}
         self.indexer.index_repository(
             name, root, {k: h.structure for k, h in self.open_handlers[name].items()}
         )
 
-        # Get and return instructions
         instructions = self._get_repo_instructions(name)
-
         result = {"opened": True, "files": files, "instructions": instructions}
 
-        # If there are uncommitted changes, include them in the response
         if not status_info["clean"]:
             result["change_in_progress"] = True
             result["changed_files"] = status_info["files"]
-
-            # Create a human-readable summary
             file_summaries = []
             for file_info in status_info["files"]:
                 status_text = ", ".join(file_info["status"])
@@ -669,13 +454,16 @@ class PyProjectMCPServer:
 
             • **Always** call `dazbuild_start_change` before any write/add/delete.
             • Edit at the *smallest hierarchy node* you can.
-            • Add a `unittest` block (real tests, no mocks) to **every** Python file.
+            • No mocks or stubs allowed - all tests must test real functionality.
+            • Tests must never access keyring - 'keyring' cannot appear after TestCase.
+            • Add a `unittest` block (real tests, no mocks/stubs) to **every** Python file.
             • Never invoke `unittest.main()`; `dazbuild_end_change` runs tests.
             • Keep all code files under 8192 bytes; refactor if larger.
             • **Document everything**: File headers and function docstrings are required.
-            • **Tests run automatically**: write/add operations run tests and fail if tests fail.
+            • **Tests run automatically**: write/add operations verify files and fail if verification fails.
+            • **Use dazbuild_verify** to check if a file passes all rules without making changes.
 
-            `dazbuild_end_change` runs pylint + tests + file size checks. If failures occur it returns
+            `dazbuild_end_change` runs all verifications in parallel for speed. If failures occur it returns
             `{ "success": false, "message": "...", "diagnostics": {...} }`.
             Fix issues and call `dazbuild_end_change` again.
             """
@@ -698,7 +486,7 @@ class PyProjectMCPServer:
             ),
             "end_change": (
                 schema(name={"type": "string"}, message={"type": "string"}),
-                "Commit edits (pylint + tests + file sizes). Returns success boolean.",
+                "Commit edits (runs full verification). Returns success boolean.",
             ),
             "outline": (
                 schema(name={"type": "string"}, reference={"type": "string"}),
@@ -714,7 +502,7 @@ class PyProjectMCPServer:
                     reference={"type": "string"},
                     content={"type": "string"},
                 ),
-                "Replace content at reference. Runs tests after write; fails if tests fail.",
+                "Replace content at reference. Verifies file after write; fails if verification fails.",
             ),
             "delete": (
                 schema(
@@ -734,7 +522,14 @@ class PyProjectMCPServer:
                     object_name={"type": "string"},
                     content={"type": "string"},
                 ),
-                "Add new thing or file. Runs tests after add; fails if tests fail.",
+                "Add new thing or file. Verifies after add; fails if verification fails.",
+            ),
+            "verify": (
+                schema(
+                    name={"type": "string"},
+                    reference={"type": "string"},
+                ),
+                "Verify a file without making changes. Runs all checks: mock/stub detection, file size, unit tests, keyring, unittest.main, and pylint.",
             ),
             "search": (
                 schema(
@@ -743,13 +538,6 @@ class PyProjectMCPServer:
                     limit={"type": "integer", "default": 10},
                 ),
                 "Vector search in repo.",
-            ),
-            "run_file_tests": (
-                schema(
-                    name={"type": "string"},
-                    reference={"type": "string"},
-                ),
-                "Run unit tests for a specific Python file.",
             ),
             "update_instructions": (
                 schema(
@@ -770,6 +558,16 @@ class PyProjectMCPServer:
                 )
                 for n, (sch, desc) in tools.items()
             ]
+
+        @self.server.list_resources()
+        async def list_resources():
+            # Return empty list - this server doesn't provide resources
+            return []
+
+        @self.server.list_prompts()
+        async def list_prompts():
+            # Return empty list - this server doesn't provide prompts
+            return []
 
         @self.server.call_tool()
         async def call_tool(name: str, args: Any):
@@ -803,12 +601,12 @@ class PyProjectMCPServer:
                         args["object_name"],
                         args["content"],
                     )
+                elif cmd == "verify":
+                    res = self._verify(args["name"], args["reference"])
                 elif cmd == "search":
                     res = self._search(
                         args["name"], args["query"], args.get("limit", 10)
                     )
-                elif cmd == "run_file_tests":
-                    res = self._run_file_tests_tool(args["name"], args["reference"])
                 elif cmd == "update_instructions":
                     self._update_repo_instructions(args["name"], args["instructions"])
                     res = {"updated": True, "instructions": args["instructions"]}
@@ -831,7 +629,7 @@ class PyProjectMCPServer:
         try:
             self._load_config()
         except Exception as exc:
-            error(str(exc))
+            print(f"Error loading config: {str(exc)}", file=sys.stderr)
             return
         async with mcp.server.stdio.stdio_server() as (r, w):
             await self.server.run(
@@ -839,7 +637,7 @@ class PyProjectMCPServer:
                 w,
                 InitializationOptions(
                     server_name="daz-python-code-navigator",
-                    server_version="3.1.0",
+                    server_version="4.3.0",
                     capabilities=self.server.get_capabilities(
                         notification_options=NotificationOptions(),
                         experimental_capabilities={},
